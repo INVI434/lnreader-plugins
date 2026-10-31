@@ -1,6 +1,5 @@
-// AI-assisted plugin. If the site redesigns, prefer rewriting this file
-// over patching the generic card selectors in parseNovelCards().
-// No complex regex is used intentionally.
+// AI-assisted plugin. If the site redesigns, prefer rewriting this file.
+// No complex regex or iterators are used intentionally for React Native compatibility.
 
 import { fetchText } from '@libs/fetch';
 import { Plugin } from '@/types/plugin';
@@ -15,6 +14,10 @@ class ReadNovelEuPlugin {
   icon = 'src/en/readnovelEu/icon.png';
   site = 'https://readnovel.eu';
   version = '1.0.0';
+
+  imageRequestInit = {
+    headers: { Referer: `${this.site}/` },
+  };
 
   filters = {
     status: {
@@ -35,7 +38,9 @@ class ReadNovelEuPlugin {
     const params = new URLSearchParams();
     params.set('page', String(pageNo));
     if (showLatestNovels) params.set('order_by', 'new');
-    if (filters?.status?.value) params.set('status', String(filters.status.value));
+
+    const statusValue = filters?.status?.value;
+    if (statusValue) params.set('status', String(statusValue));
 
     const body = await fetchText(`${this.site}/browse?${params.toString()}`);
     return this.parseNovelCards(loadCheerio(body));
@@ -78,62 +83,90 @@ class ReadNovelEuPlugin {
     const $ = loadCheerio(body);
 
     const content = $('div#chapter-content');
-    content.find("aside[aria-label='Advertisement'], script, style").remove();
+    content
+      .find("aside[aria-label='Advertisement'], script, style")
+      .remove();
 
     return content.html() ?? '';
   }
 
-  resolveUrl(path, _isNovel) {
-    return path.startsWith('http') ? path : `${this.site}${path}`;
-  }
+  resolveUrl = (path, _isNovel) =>
+    path.startsWith('http') ? path : `${this.site}${path}`;
 
   parseCover($) {
-    const coverImg = $('img').filter((_, el) => /cover$/i.test($(el).attr('alt') || '')).first();
-    return coverImg.attr('src') || $('div.w-28 img').first().attr('src') || defaultCover;
+    const coverImg = $('img')
+      .filter((_, el) => /cover$/i.test($(el).attr('alt') || ''))
+      .first();
+
+    return (
+      coverImg.attr('src') ||
+      $('div.w-28 img').first().attr('src') ||
+      defaultCover
+    );
   }
 
   parseAuthor($) {
     let author = '';
+
     $('p').each((_, el) => {
       const $el = $(el);
       const text = $el.text().trim();
+
       if (/^by\s+/i.test(text)) {
-        author = $el.find('span').first().text().trim() || text.replace(/^by\s+/i, '');
+        author =
+          $el.find('span.text-foreground').first().text().trim() ||
+          $el.find('span').first().text().trim() ||
+          text.replace(/^by\s+/i, '');
         return false;
       }
     });
+
     return author;
   }
 
+  // Iterator-free: uses a plain array and .includes()
   parseGenres($) {
-    const genres = new Set();
+    const genres = [];
+
     $("a[href*='/genre/'], a[href*='/show_all/categories/']").each((_, el) => {
       const text = $(el).text().trim();
-      if (text) genres.add(text);
+      if (text && !genres.includes(text)) {
+        genres.push(text);
+      }
     });
-    return [...genres].join(', ');
+
+    return genres.join(', ');
   }
 
   parseStatus($) {
     const statusText = $('span, div')
-      .filter((_, el) => /^(ongoing|completed|hiatus|dropped)$/i.test($(el).text().trim()))
-      .first().text().trim().toLowerCase();
+      .filter((_, el) =>
+        /^(ongoing|completed|hiatus|dropped|on hold|cancelled)$/i.test(
+          $(el).text().trim(),
+        ),
+      )
+      .first()
+      .text()
+      .trim()
+      .toLowerCase();
 
-    switch (statusText) {
-      case 'ongoing': return NovelStatus.Ongoing;
-      case 'completed': return NovelStatus.Completed;
-      case 'hiatus': return NovelStatus.OnHiatus;
-      case 'dropped': return NovelStatus.Cancelled;
-      default: return NovelStatus.Unknown;
-    }
+    if (statusText === 'ongoing') return NovelStatus.Ongoing;
+    if (statusText === 'completed') return NovelStatus.Completed;
+    if (statusText === 'hiatus' || statusText === 'on hold')
+      return NovelStatus.OnHiatus;
+    if (statusText === 'dropped' || statusText === 'cancelled')
+      return NovelStatus.Cancelled;
+    return NovelStatus.Unknown;
   }
 
   parseChapterList($) {
     const chapters = [];
+
     $('section#chapters ol li').each((_, li) => {
       const $li = $(li);
       const $a = $li.find("a[href*='/chapter/']").first();
       const path = $a.attr('href');
+
       if (!path) return;
 
       const $clone = $a.clone();
@@ -141,6 +174,7 @@ class ReadNovelEuPlugin {
       $clone.find('time').remove();
 
       const name = $clone.text().replace(/\s+/g, ' ').trim();
+
       const numberFromPath = Number(path.match(/-(\d+)(?:[?#]|$)/)?.[1]);
       const chapterNumber = Number.isNaN(numberFromPath)
         ? parseInt($li.attr('data-n') || '', 10)
@@ -153,41 +187,54 @@ class ReadNovelEuPlugin {
         releaseTime,
       });
     });
+
     return chapters;
   }
 
   parseTotalPages($) {
     let total = 1;
+
     $("nav[aria-label='Chapter ranges'] a[href*='page=']").each((_, el) => {
       const href = $(el).attr('href') || '';
       const match = href.match(/[?&]page=(\d+)/);
       if (match) total = Math.max(total, Number(match[1]));
     });
+
     return total;
   }
 
+  // Iterator-free: uses a plain object for deduplication
   parseNovelCards($) {
-    const found = new Map();
+    const foundPaths = {};
+    const novels = [];
+
     $("a[href^='/novel/']").each((_, el) => {
       const href = $(el).attr('href');
       if (!href) return;
+
       const path = href.split('?')[0].split('#')[0];
-      if (found.has(path)) return;
+      if (foundPaths[path]) return;
 
       const $el = $(el);
       const card = $el.closest('article, li, div');
-      const name = $el.find('h3, h2, [class*="font-display"]').first().text().trim()
-        || card.find('h3, h2').first().text().trim()
-        || $el.text().trim();
+
+      const name =
+        $el.find('h3, h2, [class*="font-display"]').first().text().trim() ||
+        card.find('h3, h2').first().text().trim() ||
+        $el.text().trim();
+
       if (!name) return;
 
-      const cover = card.find('img').first().attr('src')
-        || $el.find('img').first().attr('src')
-        || defaultCover;
+      const cover =
+        card.find('img').first().attr('src') ||
+        $el.find('img').first().attr('src') ||
+        defaultCover;
 
-      found.set(path, { name, path, cover });
+      foundPaths[path] = true;
+      novels.push({ name, path, cover });
     });
-    return [...found.values()];
+
+    return novels;
   }
 }
 
